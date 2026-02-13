@@ -135,6 +135,14 @@ fn count_lines(text: &str) -> usize {
     text.lines().count().max(1)
 }
 
+fn is_prev_entry_key(ch: char) -> bool {
+    matches!(ch, ',' | '<' | '，' | '､' | '、' | '﹐' | '٫')
+}
+
+fn is_next_entry_key(ch: char) -> bool {
+    matches!(ch, '.' | '>' | '。' | '｡' | '．' | '﹒')
+}
+
 pub fn run_dynamic_search(cache: &mut DictionaryStore) -> Result<()> {
     with_tui(|terminal| {
         let mut state = SearchState::default();
@@ -171,11 +179,11 @@ pub fn run_dynamic_search(cache: &mut DictionaryStore) -> Result<()> {
                             Err(err) => state.status_text = format!("打开网页失败: {err}"),
                         }
                     }
-                    KeyCode::Char(',') | KeyCode::Char('<') => {
+                    KeyCode::Char(ch) if is_prev_entry_key(ch) => {
                         state.selected = state.selected.saturating_sub(1);
                         state.refresh_detail(cache, &mut definition_cache);
                     }
-                    KeyCode::Char('.') | KeyCode::Char('>') => {
+                    KeyCode::Char(ch) if is_next_entry_key(ch) => {
                         if state.selected + 1 < state.result_indexes.len() {
                             state.selected += 1;
                             state.refresh_detail(cache, &mut definition_cache);
