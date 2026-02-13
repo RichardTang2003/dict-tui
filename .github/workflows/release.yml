@@ -23,10 +23,10 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             binary: dict-tui
-          - runner: macos-13
+          - runner: macos-latest
             target: x86_64-apple-darwin
             binary: dict-tui
-          - runner: macos-14
+          - runner: macos-latest
             target: aarch64-apple-darwin
             binary: dict-tui
           - runner: windows-latest
