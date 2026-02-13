@@ -126,7 +126,7 @@ impl Default for SearchState {
             detail_entry_idx: None,
             detail_scroll: 0,
             detail_line_count: count_lines(&text),
-            status_text: "Ctrl+O/F2 打开网页预览（JS 已忽略）".to_string(),
+            status_text: String::new(),
         }
     }
 }
@@ -285,20 +285,39 @@ fn draw_results_ui(frame: &mut ratatui::Frame, cache: &DictionaryStore, state: &
     }
     frame.render_stateful_widget(list, columns[0], &mut list_state);
 
-    let status = Paragraph::new(state.status_text.as_str())
-        .block(Block::default().title("状态").borders(Borders::TOP));
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
-        .split(columns[1]);
-
     let scroll = state.detail_scroll.min(u16::MAX as usize) as u16;
+    let detail_title = build_detail_title(state, columns[1].width);
     let detail = Paragraph::new(state.detail_text.as_str())
-        .block(Block::default().title("词条详情").borders(Borders::ALL))
+        .block(Block::default().title(detail_title).borders(Borders::ALL))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(detail, right_chunks[0]);
-    frame.render_widget(status, right_chunks[1]);
+    frame.render_widget(detail, columns[1]);
+}
+
+fn build_detail_title(state: &SearchState, area_width: u16) -> String {
+    let title = if state.status_text.is_empty() {
+        "词条详情".to_string()
+    } else {
+        format!("词条详情 | {}", state.status_text)
+    };
+    let max_chars = area_width.saturating_sub(2) as usize;
+    truncate_with_ellipsis(&title, max_chars)
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars - 1).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn open_selected_entry_in_browser(
