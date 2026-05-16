@@ -1,17 +1,21 @@
+mod app;
 mod cache;
-mod dictionary;
+mod dict;
+mod ai;
+mod ui;
 mod render;
-mod tui;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-use crate::dictionary::DictionaryStore;
-use crate::tui::run_dynamic_search;
+use crate::app::Config;
+use crate::dict::DictionaryStore;
+use crate::ui::run_search;
 
 fn run() -> Result<()> {
+    let config = Config::load().unwrap_or_default();
     println!("正在扫描并缓存词典...");
     let mut store = load_store_with_prompt()?;
     println!(
@@ -22,7 +26,7 @@ fn run() -> Result<()> {
     println!("进入动态搜索：输入/删除字符会实时查询。");
     println!("按 Esc 退出程序。");
 
-    run_dynamic_search(&mut store)
+    run_search(&mut store, config)
 }
 
 fn load_store_with_prompt() -> Result<DictionaryStore> {

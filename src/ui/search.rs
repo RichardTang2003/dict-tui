@@ -1,26 +1,53 @@
 use std::io;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Modifier, Style},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
+};
 
+use crate::ai::AiClient;
+use crate::app::Config;
 use crate::cache::{
-    DEFINITION_CACHE_CAPACITY, DefinitionCache, QueryResultCache, SEARCH_CACHE_CAPACITY,
+    DefinitionCache, QueryResultCache, DEFINITION_CACHE_CAPACITY, SEARCH_CACHE_CAPACITY,
 };
-use crate::dictionary::DictionaryStore;
+use crate::dict::DictionaryStore;
 use crate::render::{build_preview_html_file, html_to_plain_text, open_in_browser};
+use crate::ui::config_editor::run_config_editor;
 
 const PAGE_STEP: usize = 10;
 const DETAIL_SCROLL_STEP: usize = 3;
+const AI_SPINNER: &[&str] = &["-", "\\", "|", "/"];
+
+type AiTaskResult = std::result::Result<String, String>;
+
+struct PendingAiQuery {
+    query: String,
+    context: String,
+    receiver: Receiver<AiTaskResult>,
+    handle: tokio::task::JoinHandle<()>,
+    tick: usize,
+}
+
+enum AiPollOutcome {
+    Pending(String),
+    Complete {
+        query: String,
+        context: String,
+        result: AiTaskResult,
+    },
+    Disconnected(String),
+}
 
 #[derive(Debug)]
 struct SearchState {
@@ -37,11 +64,11 @@ struct SearchState {
 impl SearchState {
     fn update_results(&mut self, dict: &DictionaryStore, result_cache: &mut QueryResultCache) {
         self.result_indexes = result_cache.query(dict, &self.query);
-        if self.result_indexes.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.result_indexes.len() {
-            self.selected = self.result_indexes.len() - 1;
-        }
+        self.selected = if self.result_indexes.is_empty() {
+            0
+        } else {
+            self.selected.min(self.result_indexes.len() - 1)
+        };
         self.detail_entry_idx = None;
         self.detail_scroll = 0;
     }
@@ -68,7 +95,7 @@ impl SearchState {
         }
 
         let Some(entry_idx) = self.selected_entry_index() else {
-            self.detail_text = "未找到匹配词条，尝试修改或缩短关键词。".to_string();
+            self.detail_text = "未找到匹配词条，请尝试修改或缩短关键词。".to_string();
             self.detail_entry_idx = None;
             self.detail_scroll = 0;
             self.detail_line_count = count_lines(&self.detail_text);
@@ -105,11 +132,11 @@ impl SearchState {
         }
     }
 
-    fn scroll_detail_up(&mut self) {
+    fn scroll_up(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_sub(DETAIL_SCROLL_STEP);
     }
 
-    fn scroll_detail_down(&mut self) {
+    fn scroll_down(&mut self) {
         let max_scroll = self.detail_line_count.saturating_sub(1);
         self.detail_scroll = (self.detail_scroll + DETAIL_SCROLL_STEP).min(max_scroll);
     }
@@ -135,24 +162,40 @@ fn count_lines(text: &str) -> usize {
     text.lines().count().max(1)
 }
 
-fn is_prev_entry_key(ch: char) -> bool {
-    matches!(ch, ',' | '<' | '，' | '､' | '、' | '﹐' | '٫')
+fn handle_query_backspace(
+    state: &mut SearchState,
+    store: &mut DictionaryStore,
+    result_cache: &mut QueryResultCache,
+    definition_cache: &mut DefinitionCache,
+) {
+    if state.query.pop().is_none() {
+        return;
+    }
+
+    state.selected = 0;
+    state.update_results(store, result_cache);
+    state.refresh_detail(store, definition_cache);
 }
 
-fn is_next_entry_key(ch: char) -> bool {
-    matches!(ch, '.' | '>' | '。' | '｡' | '．' | '﹒')
+fn is_prev_key(ch: char) -> bool {
+    matches!(ch, ',' | '<')
 }
 
-pub fn run_dynamic_search(cache: &mut DictionaryStore) -> Result<()> {
+fn is_next_key(ch: char) -> bool {
+    matches!(ch, '.' | '>')
+}
+
+pub fn run_search(store: &mut DictionaryStore, mut config: Config) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
     with_tui(|terminal| {
         let mut state = SearchState::default();
         let mut result_cache = QueryResultCache::new(SEARCH_CACHE_CAPACITY);
         let mut definition_cache = DefinitionCache::new(DEFINITION_CACHE_CAPACITY);
+        let mut ai_task: Option<PendingAiQuery> = None;
 
         loop {
-            terminal.draw(|frame| {
-                draw_results_ui(frame, cache, &state);
-            })?;
+            poll_ai_task(&mut state, &mut ai_task);
+            terminal.draw(|frame| draw_ui(frame, store, &state))?;
 
             if !event::poll(Duration::from_millis(100))? {
                 continue;
@@ -168,78 +211,231 @@ pub fn run_dynamic_search(cache: &mut DictionaryStore) -> Result<()> {
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::F(2) => {
-                        match open_selected_entry_in_browser(&state, cache, &mut definition_cache) {
+                        match open_in_browser_action(&state, store, &mut definition_cache) {
                             Ok(()) => state.status_text = "已打开浏览器预览".to_string(),
                             Err(err) => state.status_text = format!("打开网页失败: {err}"),
                         }
                     }
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match open_selected_entry_in_browser(&state, cache, &mut definition_cache) {
+                        match open_in_browser_action(&state, store, &mut definition_cache) {
                             Ok(()) => state.status_text = "已打开浏览器预览".to_string(),
                             Err(err) => state.status_text = format!("打开网页失败: {err}"),
                         }
                     }
-                    KeyCode::Char(ch) if is_prev_entry_key(ch) => {
-                        state.selected = state.selected.saturating_sub(1);
-                        state.refresh_detail(cache, &mut definition_cache);
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        start_ai_query(&rt, &config, &mut state, &mut ai_task, store);
                     }
-                    KeyCode::Char(ch) if is_next_entry_key(ch) => {
-                        if state.selected + 1 < state.result_indexes.len() {
-                            state.selected += 1;
-                            state.refresh_detail(cache, &mut definition_cache);
+                    KeyCode::F(4) => {
+                        match run_config_editor(terminal, config.clone()) {
+                            Ok(new_config) => {
+                                config = new_config;
+                                state.status_text = "配置已更新".to_string();
+                            }
+                            Err(err) => {
+                                state.status_text = format!("配置页错误: {err}");
+                            }
                         }
+                        terminal.clear()?;
+                    }
+                    KeyCode::Char(ch) if is_prev_key(ch) => {
+                        state.selected = state.selected.saturating_sub(1);
+                        state.refresh_detail(store, &mut definition_cache);
+                    }
+                    KeyCode::Char(ch)
+                        if is_next_key(ch) && state.selected + 1 < state.result_indexes.len() =>
+                    {
+                        state.selected += 1;
+                        state.refresh_detail(store, &mut definition_cache);
                     }
                     KeyCode::Backspace => {
-                        if state.query.pop().is_some() {
-                            state.selected = 0;
-                            state.update_results(cache, &mut result_cache);
-                            state.refresh_detail(cache, &mut definition_cache);
-                        }
+                        handle_query_backspace(
+                            &mut state,
+                            store,
+                            &mut result_cache,
+                            &mut definition_cache,
+                        );
                     }
-                    KeyCode::Char(ch) => {
-                        if !ch.is_control() {
-                            state.query.push(ch);
-                            state.selected = 0;
-                            state.update_results(cache, &mut result_cache);
-                            state.refresh_detail(cache, &mut definition_cache);
-                        }
+                    KeyCode::Char(ch) if !ch.is_control() => {
+                        state.query.push(ch);
+                        state.selected = 0;
+                        state.update_results(store, &mut result_cache);
+                        state.refresh_detail(store, &mut definition_cache);
                     }
-                    KeyCode::Up => {
-                        state.scroll_detail_up();
-                    }
-                    KeyCode::Down => {
-                        state.scroll_detail_down();
-                    }
+                    KeyCode::Up => state.scroll_up(),
+                    KeyCode::Down => state.scroll_down(),
                     KeyCode::Home => {
                         state.selected = 0;
-                        state.refresh_detail(cache, &mut definition_cache);
+                        state.refresh_detail(store, &mut definition_cache);
                     }
-                    KeyCode::End => {
-                        if !state.result_indexes.is_empty() {
-                            state.selected = state.result_indexes.len() - 1;
-                            state.refresh_detail(cache, &mut definition_cache);
-                        }
+                    KeyCode::End if !state.result_indexes.is_empty() => {
+                        state.selected = state.result_indexes.len() - 1;
+                        state.refresh_detail(store, &mut definition_cache);
                     }
                     KeyCode::PageUp => {
                         state.selected = state.selected.saturating_sub(PAGE_STEP);
-                        state.refresh_detail(cache, &mut definition_cache);
+                        state.refresh_detail(store, &mut definition_cache);
                     }
-                    KeyCode::PageDown => {
-                        if !state.result_indexes.is_empty() {
-                            state.selected =
-                                (state.selected + PAGE_STEP).min(state.result_indexes.len() - 1);
-                            state.refresh_detail(cache, &mut definition_cache);
-                        }
+                    KeyCode::PageDown if !state.result_indexes.is_empty() => {
+                        state.selected =
+                            (state.selected + PAGE_STEP).min(state.result_indexes.len() - 1);
+                        state.refresh_detail(store, &mut definition_cache);
                     }
                     _ => {}
                 }
             }
         }
+
+        abort_ai_task(&mut ai_task);
         Ok(())
     })
 }
 
-fn draw_results_ui(frame: &mut ratatui::Frame, cache: &DictionaryStore, state: &SearchState) {
+fn start_ai_query(
+    rt: &tokio::runtime::Runtime,
+    config: &Config,
+    state: &mut SearchState,
+    ai_task: &mut Option<PendingAiQuery>,
+    store: &DictionaryStore,
+) {
+    let query = state.query.trim().to_string();
+    if query.is_empty() {
+        state.status_text = "请先输入要查询的内容".to_string();
+        return;
+    }
+
+    let ai_context = state
+        .selected_entry_index()
+        .map(|idx| {
+            let entry = &store.entries[idx];
+            format!("[词典词条] {} ({})\n", entry.word, entry.source)
+        })
+        .unwrap_or_default();
+
+    abort_ai_task(ai_task);
+
+    state.status_text = format!("AI 查询 '{}' ...", query);
+    state.detail_text = build_ai_pending_detail(&query, &ai_context, 0);
+    state.detail_scroll = 0;
+    state.detail_line_count = count_lines(&state.detail_text);
+
+    *ai_task = Some(spawn_ai_query(rt, config.clone(), query, ai_context));
+}
+
+fn abort_ai_task(ai_task: &mut Option<PendingAiQuery>) {
+    if let Some(task) = ai_task.take() {
+        task.handle.abort();
+    }
+}
+
+fn spawn_ai_query(
+    rt: &tokio::runtime::Runtime,
+    config: Config,
+    query: String,
+    context: String,
+) -> PendingAiQuery {
+    let (sender, receiver) = mpsc::channel();
+    let task_query = query.clone();
+    let task_context = context.clone();
+    let handle = rt.spawn(async move {
+        let ai = AiClient::new(config);
+        let result = ai
+            .query_with_context(&task_query, &task_context)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = sender.send(result);
+    });
+
+    PendingAiQuery {
+        query,
+        context,
+        receiver,
+        handle,
+        tick: 0,
+    }
+}
+
+fn poll_ai_task(state: &mut SearchState, ai_task: &mut Option<PendingAiQuery>) {
+    let outcome = {
+        let Some(task) = ai_task.as_mut() else {
+            return;
+        };
+
+        match task.receiver.try_recv() {
+            Ok(result) => AiPollOutcome::Complete {
+                query: task.query.clone(),
+                context: task.context.clone(),
+                result,
+            },
+            Err(TryRecvError::Empty) => {
+                task.tick = task.tick.wrapping_add(1);
+                let spinner = AI_SPINNER[(task.tick / 2) % AI_SPINNER.len()];
+                AiPollOutcome::Pending(format!("AI 查询中 {} {}", spinner, task.query))
+            }
+            Err(TryRecvError::Disconnected) => AiPollOutcome::Disconnected(task.query.clone()),
+        }
+    };
+
+    match outcome {
+        AiPollOutcome::Pending(status) => {
+            state.status_text = status;
+        }
+        AiPollOutcome::Complete {
+            query,
+            context,
+            result,
+        } => {
+            match result {
+                Ok(answer) => {
+                    state.detail_text = build_ai_answer_detail(&query, &context, &answer);
+                    state.status_text = format!("AI 查询完成: {query}");
+                }
+                Err(err) => {
+                    state.detail_text = format!("--- AI 查询失败: {query} ---\n\n{err}");
+                    state.status_text = format!("AI 查询失败: {query}");
+                }
+            }
+            state.detail_scroll = 0;
+            state.detail_line_count = count_lines(&state.detail_text);
+            *ai_task = None;
+        }
+        AiPollOutcome::Disconnected(query) => {
+            state.detail_text = format!("--- AI 查询失败: {query} ---\n\nAI 任务已中断。");
+            state.detail_scroll = 0;
+            state.detail_line_count = count_lines(&state.detail_text);
+            state.status_text = format!("AI 查询中断: {query}");
+            *ai_task = None;
+        }
+    }
+}
+
+fn build_ai_pending_detail(query: &str, context: &str, tick: usize) -> String {
+    let spinner = AI_SPINNER[(tick / 2) % AI_SPINNER.len()];
+    let header = if context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", context.trim())
+    };
+
+    format!(
+        "{}--- AI 回答: {} ---\n\nAI 查询中 {} \n\n可以继续输入、滚动或打开配置页；结果返回后会自动更新到这里。",
+        header, query, spinner
+    )
+}
+
+fn build_ai_answer_detail(query: &str, context: &str, answer: &str) -> String {
+    if context.trim().is_empty() {
+        format!("--- AI 回答: {} ---\n\n{}", query, answer)
+    } else {
+        format!(
+            "{}\n--- AI 回答: {} ---\n\n{}",
+            context.trim(),
+            query,
+            answer
+        )
+    }
+}
+
+fn draw_ui(frame: &mut Frame, store: &DictionaryStore, state: &SearchState) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -257,7 +453,7 @@ fn draw_results_ui(frame: &mut ratatui::Frame, cache: &DictionaryStore, state: &
     frame.render_widget(input, rows[0]);
 
     let tip = Paragraph::new(format!(
-        "输入/退格实时查询 | ,/. 切换词条 | ↑/↓ 滚动详情 | Ctrl+O/F2 打开网页 | Esc 退出 | 命中 {} 条",
+        "输入/退格实时查询 | ,/. 切换词条 | ↑/↓ 滚动详情 | Ctrl+G AI查询 | F4 配置 | Ctrl+O/F2 网页 | Esc 退出 | 命中 {} 条",
         state.result_indexes.len(),
     ));
     frame.render_widget(tip, rows[1]);
@@ -276,7 +472,7 @@ fn draw_results_ui(frame: &mut ratatui::Frame, cache: &DictionaryStore, state: &
             .result_indexes
             .iter()
             .map(|idx| {
-                let entry = &cache.entries[*idx];
+                let entry = &store.entries[*idx];
                 ListItem::new(format!("{}  [{}]", entry.word, entry.source))
             })
             .collect()
@@ -328,7 +524,7 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn open_selected_entry_in_browser(
+fn open_in_browser_action(
     state: &SearchState,
     dict: &mut DictionaryStore,
     definition_cache: &mut DefinitionCache,
