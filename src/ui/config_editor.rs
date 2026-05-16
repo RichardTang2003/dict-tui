@@ -10,8 +10,10 @@ use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 
 use crate::app::Config;
 
-const FIELD_COUNT: usize = 5;
-const FIELD_SYSTEM_PROMPT: usize = 4;
+const FIELD_COUNT: usize = 7;
+const FIELD_WEB_SEARCH: usize = 4;
+const FIELD_JAVASCRIPT: usize = 5;
+const FIELD_SYSTEM_PROMPT: usize = 6;
 
 #[derive(Debug)]
 struct EditorState {
@@ -186,7 +188,6 @@ fn handle_edit_key(state: &mut EditorState, code: KeyCode) {
 }
 
 fn draw_config_ui(frame: &mut Frame, state: &EditorState) {
-    let area = frame.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -195,7 +196,7 @@ fn draw_config_ui(frame: &mut Frame, state: &EditorState) {
             Constraint::Min(10),
             Constraint::Length(1),
         ])
-        .split(area);
+        .split(frame.area());
 
     let header_text = if state.editing {
         "AI 配置 | 编辑中: Enter/F2 完成，Tab 保存并切换，Ctrl+S 保存配置，Esc 取消"
@@ -207,12 +208,16 @@ fn draw_config_ui(frame: &mut Frame, state: &EditorState) {
         rows[0],
     );
 
-    let selected_line = format!("当前字段: {}", state.selected_label());
-    frame.render_widget(Paragraph::new(selected_line), rows[1]);
+    frame.render_widget(
+        Paragraph::new(format!("当前字段: {}", state.selected_label())),
+        rows[1],
+    );
 
     let content_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -233,7 +238,6 @@ fn draw_single_line_field(frame: &mut Frame, area: Rect, state: &EditorState, id
     let selected = state.selected == idx;
     let editing = selected && state.editing;
     let border_style = field_border_style(selected, editing);
-    let title = field_label(idx);
     let inner = inner_rect(area);
     let display_value;
     let value = if editing {
@@ -252,7 +256,7 @@ fn draw_single_line_field(frame: &mut Frame, area: Rect, state: &EditorState, id
     frame.render_widget(
         Paragraph::new(text).block(
             Block::default()
-                .title(title)
+                .title(field_label(idx))
                 .borders(Borders::ALL)
                 .border_style(border_style),
         ),
@@ -313,6 +317,8 @@ fn field_label(idx: usize) -> &'static str {
         1 => "API Key",
         2 => "模型",
         3 => "回答语言",
+        FIELD_WEB_SEARCH => "网页搜索",
+        FIELD_JAVASCRIPT => "浏览器 JS",
         FIELD_SYSTEM_PROMPT => "系统提示词",
         _ => "",
     }
@@ -324,6 +330,8 @@ fn field_value(config: &Config, idx: usize) -> String {
         1 => config.api_key.clone(),
         2 => config.model.clone(),
         3 => config.answer_language.clone(),
+        FIELD_WEB_SEARCH => bool_to_text(config.enable_web_search).to_string(),
+        FIELD_JAVASCRIPT => bool_to_text(config.enable_javascript).to_string(),
         FIELD_SYSTEM_PROMPT => config.system_prompt.clone(),
         _ => String::new(),
     }
@@ -335,6 +343,8 @@ fn set_field_value(config: &mut Config, idx: usize, value: String) {
         1 => config.api_key = value,
         2 => config.model = value,
         3 => config.answer_language = value,
+        FIELD_WEB_SEARCH => config.enable_web_search = parse_bool(&value),
+        FIELD_JAVASCRIPT => config.enable_javascript = parse_bool(&value),
         FIELD_SYSTEM_PROMPT => config.system_prompt = value,
         _ => {}
     }
@@ -346,6 +356,21 @@ fn field_display_value(state: &EditorState, idx: usize) -> String {
     } else {
         field_value(&state.config, idx)
     }
+}
+
+fn bool_to_text(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on" | "enable" | "enabled"
+    ) || matches!(value.trim(), "是" | "开" | "开启" | "启用")
 }
 
 fn field_border_style(selected: bool, editing: bool) -> Style {

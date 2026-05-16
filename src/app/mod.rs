@@ -11,6 +11,10 @@ pub struct Config {
     pub answer_language: String,
     pub system_prompt: String,
     pub model: String,
+    #[serde(default)]
+    pub enable_web_search: bool,
+    #[serde(default)]
+    pub enable_javascript: bool,
 }
 
 impl Default for Config {
@@ -21,6 +25,8 @@ impl Default for Config {
             answer_language: "中文".to_string(),
             model: "gpt-4o-mini".to_string(),
             system_prompt: crate::ai::prompt::default_system_prompt().to_string(),
+            enable_web_search: false,
+            enable_javascript: false,
         }
     }
 }
@@ -37,15 +43,13 @@ impl Config {
             .with_context(|| format!("解析配置文件失败: {}", config_path.display()))
     }
 
-    #[allow(dead_code)]
     pub fn save(&self) -> Result<()> {
         let config_path = config_file_path()?;
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
         }
-        let content = serde_json::to_string_pretty(self)
-            .context("序列化配置失败")?;
+        let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
         fs::write(&config_path, content)
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
         Ok(())
@@ -53,8 +57,7 @@ impl Config {
 }
 
 fn config_file_path() -> Result<PathBuf> {
-    let mut path = dirs::config_dir()
-        .context("无法获取配置目录")?;
+    let mut path = dirs::config_dir().context("无法获取配置目录")?;
     path.push("dict-tui");
     path.push("config.json");
     Ok(path)

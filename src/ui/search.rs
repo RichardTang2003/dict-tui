@@ -211,13 +211,15 @@ pub fn run_search(store: &mut DictionaryStore, mut config: Config) -> Result<()>
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::F(2) => {
-                        match open_in_browser_action(&state, store, &mut definition_cache) {
+                        match open_in_browser_action(&state, store, &mut definition_cache, &config)
+                        {
                             Ok(()) => state.status_text = "已打开浏览器预览".to_string(),
                             Err(err) => state.status_text = format!("打开网页失败: {err}"),
                         }
                     }
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match open_in_browser_action(&state, store, &mut definition_cache) {
+                        match open_in_browser_action(&state, store, &mut definition_cache, &config)
+                        {
                             Ok(()) => state.status_text = "已打开浏览器预览".to_string(),
                             Err(err) => state.status_text = format!("打开网页失败: {err}"),
                         }
@@ -528,6 +530,7 @@ fn open_in_browser_action(
     state: &SearchState,
     dict: &mut DictionaryStore,
     definition_cache: &mut DefinitionCache,
+    config: &Config,
 ) -> Result<()> {
     let Some(entry_idx) = state.selected_entry_index() else {
         bail!("当前没有可打开的词条");
@@ -535,7 +538,8 @@ fn open_in_browser_action(
 
     let raw_definition = definition_cache.get_or_load(dict, entry_idx)?;
     let (word, asset_dir) = dict.entry_web_context(entry_idx)?;
-    let preview_file = build_preview_html_file(&word, &raw_definition, &asset_dir)?;
+    let preview_file =
+        build_preview_html_file(&word, &raw_definition, &asset_dir, config.enable_javascript)?;
     open_in_browser(&preview_file)?;
     Ok(())
 }
